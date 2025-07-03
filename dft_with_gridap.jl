@@ -68,19 +68,27 @@ function generate_mesh(lattice::AbstractMatrix{T}, N::Int) where T
     gmsh.finalize()
 end
 
-function get_hartree_pot(model, Ω, dΩ, N_el, ρ)
-    reffe = ReferenceFE(lagrangian, Float64, 1)
+function get_hartree_pot(model, Ω, dΩ, N_el, vol, ρ)
+    reffe = ReferenceFE(lagrangian, Float64, 2)
     V = TestFESpace(model, reffe; conformity=:H1, constraint=:zeromean)
     U = TrialFESpace(V)
 
     a(u, v) = ∫(∇(u) ⋅ ∇(v))dΩ
-    l(v) = 4π*(∫(ρ*v)dΩ - N_el/vol*∫(v)dΩ)
+
+    mean_free_ρ(x) = ρ(x) - N_el/vol
+    l(v) = 4*pi*(∫(mean_free_ρ*v)dΩ)
 
     op = AffineFEOperator(a, l, V, U)
 
-    ls = LUSolver()
+    ls = BackslashSolver()
     solver = LinearFESolver(ls)
     V_hartree = solve(solver, op)
+    
+    writevtk(
+        Ω,
+        "julia/hartree_pot";
+        cellfields=["pot" => V_hartree],
+    )
 
     return V_hartree
 end
@@ -89,13 +97,13 @@ function get_Vxc(xc, ρ)
     functionals = xc.functionals
 
     function Vxc(x)
-        return -(3/pi)^(1/3)*ρ(x)^(1/3)
-        #Vρ = 0
-        #for functional in functionals
-        #    _, V_new = DftFunctionals.potential_terms(functional, ρ(x)*ones(1, 1))
-        #    Vρ += V_new[1, 1]
-        #end
-        #return Vρ
+        #return -(3/pi)^(1/3)*ρ(x)^(1/3)
+        Vρ = 0
+        for functional in functionals
+            _, V_new = DftFunctionals.potential_terms(functional, ρ(x)*ones(1, 1))
+            Vρ += V_new[1, 1]
+        end
+        return Vρ
     end
 
     return Vxc
@@ -118,23 +126,29 @@ function solve_linear_FEM(model, Ω, dΩ, k, V_eff, n_eigvals::Int)
     return λ, ϕ
 end
 
-function solve_linear_ks(k, N_el::Int, ρ::FEFunction, n_eigvals::Int, xc::DFTK.Xc)
-    V_hartree = get_hartree_pot(model, Ω, dΩ, N_el, ρ)
+function solve_linear_ks(model, Ω, dΩ, k, V_ext, N_el::Int, vol, ρ::FEFunction, n_eigvals::Int, xc::DFTK.Xc)
+    V_hartree = get_hartree_pot(model, Ω, dΩ, N_el, vol, ρ)
     Vxc = get_Vxc(xc, ρ)
-    potential(x) = V_ext(x)# + V_hartree(x) + N_el/vol + Vxc(x)
+    potential(x) = V_ext(x) + 0.5*V_hartree(x) + N_el/vol + Vxc(x)
     
     return solve_linear_FEM(model, Ω, dΩ, k, potential, n_eigvals)
 end
 
-function next_density(orbitals, N_el)
+function next_density(model, Ω, orbitals, N_el)
+    reffe = ReferenceFE(lagrangian, Float64, 1)
+    U_real = FESpace(model, reffe; conformity=:H1)
     quad = CellQuadrature(Ω, 2)
     orb_norms = [sqrt(sum(integrate(FEFunction(U_real, abs.(orbitals[:, i]).^2), quad))) for i in 1:N_el]
     
     return sum([2*abs.(orbitals[:, i]./orb_norms[i]).^2 for i in 1:Int(N_el/2)])
 end
 
-function solve_ks(k, N_el, ρ_start, n_eigvals, functionals)
+function solve_ks(model, Ω, k, V_ext, N_el, vol, ρ_start, n_eigvals, functionals)
     solver = DFTK.scf_anderson_solver()
+    reffe = ReferenceFE(lagrangian, Float64, 1)
+    U_real = FESpace(model, reffe; conformity=:H1)
+
+    dΩ = Measure(Ω, 2)
 
     function fixpoint_map(ρin, info)
         (; eigenvalues, n_iter, converged, timedout) = info
@@ -150,9 +164,9 @@ function solve_ks(k, N_el, ρ_start, n_eigvals, functionals)
             cellfields=["density$n_iter" => ρfunc],
         )
 
-        eigenvalues, orbitals = solve_linear_ks(k, N_el, ρfunc, n_eigvals, functionals)
+        eigenvalues, orbitals = solve_linear_ks(model, Ω, dΩ, k, V_ext, N_el, vol, ρfunc, n_eigvals, functionals)
         
-        next_ρ = next_density(orbitals, N_el)
+        next_ρ = next_density(model, Ω, orbitals, N_el)
         println("energy: ", calculate_energy(eigenvalues, N_el))
 
         return next_ρ, (; eigenvalues, n_iter, converged, timedout)
@@ -165,54 +179,60 @@ function solve_ks(k, N_el, ρ_start, n_eigvals, functionals)
     return FEFunction(U_real, ρout, Vector{Float64}([])), info.eigenvalues
 end
 
-calculate_energy(eigs, N_el) = sum([2*eigs[i] for i in 1:Int(N_el/2)])
+calculate_energy(eigs, N_el) = real(sum([2*eigs[i] for i in 1:Int(N_el/2)]))
+energies = []
+for N in [4, 6, 8, 10, 12, 14, 16]
 
-N = 10
+    a = 5.431u"angstrom"          # Silicon lattice constant
+    lattice = a / 2 * [[0 1 1.];  # Silicon lattice vectors
+                       [1 0 1.];  # specified column by column
+                       [1 1 0.]];
+    #lattice = [[1 0 0]; [0 1 0]; [0 0 1.]];
 
-a = 5.431u"angstrom"          # Silicon lattice constant
-lattice = a / 2 * [[0 1 1.];  # Silicon lattice vectors
-                   [1 0 1.];  # specified column by column
-                   [1 1 0.]];
-#lattice = [[1 0 0]; [0 1 0]; [0 0 1.]];
+    unitless_lattice = austrip.(lattice)
 
-unitless_lattice = austrip.(lattice)
+    N_el = 8
 
-N_el = 8
+    pd_lda_family = PseudoFamily("dojo.nc.sr.lda.v0_4_1.standard.upf")
+    Si = ElementPsp(:Si, pd_lda_family)
+    #Si = ElementPsp(:Si, nothing)
 
-pd_lda_family = PseudoFamily("dojo.nc.sr.lda.v0_4_1.standard.upf")
-Si = ElementPsp(:Si, pd_lda_family)
-#Si = ElementPsp(:Si, nothing)
+    atoms     = [Si, Si]
+    positions = [ones(3)/8, -ones(3)/8]
+    real_space_positions_au = [unitless_lattice*position for position in positions]
 
-atoms     = [Si, Si]
-positions = [ones(3)/8, -ones(3)/8]
-real_space_positions_au = [unitless_lattice*position for position in positions]
+    V_ext_preliminary(r) = sum([DFTK.local_potential_real(atom, norm(VectorValue(r...) - VectorValue(position...))) for (atom, position) in zip(atoms, real_space_positions_au)])
 
-V_ext_preliminary(r) = sum([DFTK.local_potential_real(atom, norm(VectorValue(r...) - VectorValue(position...))) for (atom, position) in zip(atoms, real_space_positions_au)])
-n_integration = 20
-V_ext_mean = sum([V_ext_preliminary(unitless_lattice*[x, y, z]/n_integration^3) for x in 0:n_integration, y in 0:n_integration, z in 0:n_integration])/((n_integration+1)^3)
-println(V_ext_mean)
+    V_ext(r) = norm(r)^2
 
+    k = VectorValue(0, 0, 0)
 
-V_ext(r) = 10^-3*norm(r .- austrip(a)/2)^2#V_ext_preliminary(r)
+    n_eigvals = 26
 
-k = VectorValue(0, 0, 0)
+    generate_mesh(lattice, N)
+    model = GmshDiscreteModel("julia/unit_cell.msh")
+    Ω = Triangulation(model)
+    dΩ = Measure(Ω, 2)
 
-n_eigvals = 8
+    reffe = ReferenceFE(lagrangian, Float64, 1)
+    U_real = FESpace(model, reffe; conformity=:H1)
 
-generate_mesh(lattice, N)
-model = GmshDiscreteModel("julia/unit_cell.msh")
-Ω = Triangulation(model)
-dΩ = Measure(Ω, 2)
+    vol = austrip(DFTK.compute_unit_cell_volume(lattice))
+    ρ = interpolate(x -> N_el/vol, U_real)
+    xc = LDA()
 
-reffe = ReferenceFE(lagrangian, Float64, 1)
-U_real = FESpace(model, reffe; conformity=:H1)
+    Vxc = get_Vxc(xc, ρ)
+    points = range(-austrip(a)/2, austrip(a)/2, 100)
+    plot(points, Vxc.(VectorValue.(points, points, points)))
+    savefig("julia/xc_potential.png")
 
-vol = austrip(DFTK.compute_unit_cell_volume(lattice))
-ρ = FEFunction(U_real, N_el/vol*ones(length(get_free_dof_ids(U_real))), Vector{Float64}([]))
-xc = LDA()
+    ρ, eigvals = solve_ks(model, Ω, k, V_ext, N_el, vol, ρ, n_eigvals, xc)
 
-ρ, eigvals = solve_ks(k, N_el, ρ, n_eigvals, xc)
+    println("energy: ", calculate_energy(eigvals, N_el))
+    global energies = push!(energies, calculate_energy(eigvals, N_el))
 
-println("energy: ", calculate_energy(eigvals, N_el))
-
-println("done")
+    println("done")
+end
+print(energies)
+plot([4, 6, 8, 10, 12, 14, 16], energies .- 30.09222653256, xlabel="N", ylabel="Energy (Hartree)", title="Energy vs N", legend=false, xscale=:log10, yscale=:log10)
+savefig("julia/energy_vs_N.png")
