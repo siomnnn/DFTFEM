@@ -28,7 +28,7 @@ positions = [ones(3)/8, -ones(3)/8]
 ## Note the implicit passing of keyword arguments here:
 ## this is equivalent to PlaneWaveBasis(model; Ecut=Ecut, kgrid=kgrid)
 
-model = Model(lattice, DFTK.Element[], AbstractVector[]; n_electrons = 8, terms = [Kinetic(), ExternalFromReal(r -> norm(r .- austrip(a)/2)^2), Hartree(), LDA()])  # Define model with LDA functional and external potential
+model = Model(lattice, DFTK.Element[], AbstractVector[]; n_electrons = 8, terms = [Kinetic(), ExternalFromReal(r -> 0.1*norm(r .- austrip(a)/2)^2), Hartree(), LDA()])  # Define model with LDA functional and external potential
 kgrid = [1, 1, 1]     # k-point grid (Regular Monkhorst-Pack grid)
 Ecut = 7              # kinetic energy cutoff
 # Ecut = 190.5u"eV"  # Could also use eV or other energy-compatible units
@@ -39,7 +39,8 @@ scfres = self_consistent_field(basis, tol=1e-5);
 #println(typeof(scfres.τ))
 #densities = DFTK.LibxcDensities(basis, 1, scfres.ρ, scfres.τ)
 save_scfres("julia/dftk_results.vts", scfres; save_ψ=true)
-scfres.energies
+@show scfres.energies
+@show 2*sum(scfres.eigenvalues[1][1:4])
 
 #@NamedTuple{
 #    ham::Hamiltonian,

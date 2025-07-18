@@ -129,7 +129,7 @@ end
 function solve_linear_ks(model, Ω, dΩ, k, V_ext, N_el::Int, vol, ρ::FEFunction, n_eigvals::Int, xc::DFTK.Xc)
     V_hartree = get_hartree_pot(model, Ω, dΩ, N_el, vol, ρ)
     Vxc = get_Vxc(xc, ρ)
-    potential(x) = V_ext(x) + 0.5*V_hartree(x) + N_el/vol + Vxc(x)
+    potential(x) = V_ext(x) + V_hartree(x) + N_el/vol + Vxc(x)
     
     return solve_linear_FEM(model, Ω, dΩ, k, potential, n_eigvals)
 end
@@ -148,10 +148,12 @@ function solve_ks(model, Ω, k, V_ext, N_el, vol, ρ_start, n_eigvals, functiona
     reffe = ReferenceFE(lagrangian, Float64, 1)
     U_real = FESpace(model, reffe; conformity=:H1)
 
+    num_dofs = num_free_dofs(U_real)
+
     dΩ = Measure(Ω, 2)
 
     function fixpoint_map(ρin, info)
-        (; eigenvalues, n_iter, converged, timedout) = info
+        (; orbitals, eigenvalues, n_iter, converged, timedout) = info
         n_iter += 1
         println("n_iter: ", n_iter)
 
@@ -166,23 +168,26 @@ function solve_ks(model, Ω, k, V_ext, N_el, vol, ρ_start, n_eigvals, functiona
 
         eigenvalues, orbitals = solve_linear_ks(model, Ω, dΩ, k, V_ext, N_el, vol, ρfunc, n_eigvals, functionals)
         
+        print(size(orbitals))
         next_ρ = next_density(model, Ω, orbitals, N_el)
         println("energy: ", calculate_energy(eigenvalues, N_el))
 
-        return next_ρ, (; eigenvalues, n_iter, converged, timedout)
+        return next_ρ, (; orbitals, eigenvalues, n_iter, converged, timedout)
     end
 
-    info_start = (; eigenvalues=[], n_iter=0, converged=false, timedout=false)
+    info_start = (; orbitals=fill(zeros((num_dofs,)), (Int(N_el/2),)), eigenvalues=[], n_iter=0, converged=false, timedout=false)
 
     ρout, info = solver(fixpoint_map, get_free_dof_values(ρ_start), info_start; maxiter=10)
 
-    return FEFunction(U_real, ρout, Vector{Float64}([])), info.eigenvalues
+    return FEFunction(U_real, ρout, Vector{Float64}([])), info.orbitals, info.eigenvalues
 end
 
-calculate_energy(eigs, N_el) = real(sum([2*eigs[i] for i in 1:Int(N_el/2)]))
+function calculate_energy(eigvals, N_el)
+    return 2*sum(real.(eigvals[1:Int(N_el/2)]))
+end
 energies = []
-for N in [4, 6, 8, 10, 12, 14, 16]
-
+for N in [4, 6, 8, 10, 12, 14, 16, 18, 20]
+    #N = 8
     a = 5.431u"angstrom"          # Silicon lattice constant
     lattice = a / 2 * [[0 1 1.];  # Silicon lattice vectors
                        [1 0 1.];  # specified column by column
@@ -203,7 +208,7 @@ for N in [4, 6, 8, 10, 12, 14, 16]
 
     V_ext_preliminary(r) = sum([DFTK.local_potential_real(atom, norm(VectorValue(r...) - VectorValue(position...))) for (atom, position) in zip(atoms, real_space_positions_au)])
 
-    V_ext(r) = norm(r)^2
+    V_ext(r) = 0.1*norm(r)^2
 
     k = VectorValue(0, 0, 0)
 
@@ -226,13 +231,19 @@ for N in [4, 6, 8, 10, 12, 14, 16]
     plot(points, Vxc.(VectorValue.(points, points, points)))
     savefig("julia/xc_potential.png")
 
-    ρ, eigvals = solve_ks(model, Ω, k, V_ext, N_el, vol, ρ, n_eigvals, xc)
+    ρ, orbitals, eigvals = solve_ks(model, Ω, k, V_ext, N_el, vol, ρ, n_eigvals, xc)
 
     println("energy: ", calculate_energy(eigvals, N_el))
     global energies = push!(energies, calculate_energy(eigvals, N_el))
 
     println("done")
 end
-print(energies)
-plot([4, 6, 8, 10, 12, 14, 16], energies .- 30.09222653256, xlabel="N", ylabel="Energy (Hartree)", title="Energy vs N", legend=false, xscale=:log10, yscale=:log10)
-savefig("julia/energy_vs_N.png")
+open("julia/energies.txt", "w") do f
+    println(f, "Eigenvalue sums for N = [4, 6, 8, 10, 12, 14, 16, 18, 20]:")
+    println(f, "---------------------------------")
+    for energy in energies
+        println(f, energy)
+    end
+end
+#plot([4, 6, 8, 10, 12, 14, 16], abs.(energies .- 36.38747469769667), xlabel="N", ylabel="Energy (Hartree)", title="Energy vs N", legend=false, xscale=:log10, yscale=:log10)
+#savefig("julia/energy_vs_N.png")
