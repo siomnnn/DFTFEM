@@ -5,6 +5,7 @@ using Plots
 using Unitful
 using UnitfulAtomic
 using PseudoPotentialData
+using StaticArrays
 
 # 1. Define lattice and atomic positions
 a = 5.431u"angstrom"          # Silicon lattice constant
